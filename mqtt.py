@@ -1,14 +1,16 @@
 '''
 MQTT Client library
 8/4/2022 V 1.0.0 N Waterton - Initial Release
+26/5/2022 V 1.0.1 N Waterton - Bug fixes
 '''
-
+import re
+from ast import literal_eval
 import logging
 import asyncio
 
 import paho.mqtt.client as mqtt
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 class MQTT():
     '''
@@ -28,16 +30,18 @@ class MQTT():
         self._user = user
         self._password = password
         self._pubtopic = pubtopic
-        self._topic = topic if not topic.endswith('/#') else subtopic[:-2]
+        self._topic = topic if not topic.endswith('/#') else topic[:-2]
         self._name = name
         self._polling = []
-        self._log.info(f'MQTT library v{self.__version__}')
+        self._log.info(f'{__class__.__name__} library v{__class__.__version__}')
         self._debug = self._log.getEffectiveLevel() <= logging.DEBUG
         self._mqttc = None
         self._method_dict = {func:getattr(self, func)  for func in dir(self) if callable(getattr(self, func)) and not func.startswith("_")}
         if poll:
             self._poll = poll[0]
             self._polling = [p for p in poll[1:] if p in self._method_dict.keys()]
+        else:
+            self._poll = None
         self._json_out = json_out
         self._delimiter = '\='
         self._topic_override = None

@@ -415,15 +415,19 @@ class Vehicle(MQTT):
             self._publish('command', "Timeout")
             return False
         result = await self._request('get', url, f'{api}/{id}')
-        if result['status'] == 552:
+        status = result.get('status', 0)
+        if status == 552:
             self.log.info('Command is pending')
             self._publish('command', "Pending")
             await asyncio.sleep(5)
             return await self.__pollStatus(url, api, id, count) # retry after 5s
-        elif result['status'] == 200:
+        elif status == 200:
             self.log.info('Command completed successfully')
             self._publish('command', "Success")
             return True
+        elif status == 587:
+            self.log.info('Command failed: {}'.format('Vehicle is in Deep Sleep, remote commands disabled'))
+            self._publish('command', 'Failed: {}'.format('Vehicle is in Deep Sleep mode'))
         else:
             self.log.info('Command failed')
             self._publish('command', "Failed")
@@ -441,6 +445,9 @@ class Vehicle(MQTT):
             if status == 590:
                 self.log.info('Command failed: {}'.format('Vehicle failed to start. You must start from inside your vehicle after two consecutive remote start events'))
                 self._publish('command', 'Failed: {}'.format('Must manually start after two remote starts'))
+            elif status == 587:
+                self.log.info('Command failed: {}'.format('Vehicle is in Deep Sleep, remote commands disabled'))
+                self._publish('command', 'Failed: {}'.format('Vehicle is in Deep Sleep mode'))
             else:
                 self.log.info('Command failed: {}'.format(result))
                 self._publish('command', 'Failed: status: {}'.format(status))
