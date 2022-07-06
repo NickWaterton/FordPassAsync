@@ -180,7 +180,7 @@ class Vehicle(MQTT):
                 self.refresh_expires_at = tokens.get("refresh_expiry_timestamp", self.refresh_expires_at)
                 self.log.info('tokens loaded')
         except Exception as e:
-            self.log.warning("cannot load tokens: {}\nWill refresh using credentials".format(e))
+            self.log.warning("cannot load tokens: {}. Will refresh using credentials".format(e))
         
     def secondsToText(self, secs):
         if secs <=60:
