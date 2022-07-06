@@ -69,8 +69,8 @@ class Vehicle(MQTT):
         self.session = None
         self.token = None
         self.refresh_token = None
-        self.expiresAt = None
-        self.refresh_expires_at = None
+        self.expiresAt = 0
+        self.refresh_expires_at = 0
         self.readToken()
         self.cache = {}
         self.cache_timeout = 5  #5 second timeout on cache, set to 0 to disable cache
