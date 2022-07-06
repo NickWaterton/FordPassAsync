@@ -4,17 +4,19 @@
 Asyncio library for communicating with FordPass enabled vehicles
 Based on https://github.com/clarkd/fordpass-python by Clark D
 1/4/2022 V 1.0.0 N Waterton - Initial Release
+5/7/2022 V 2.0.0 N Waterton - New Authentication scheme
 '''
 
 import logging
 from logging.handlers import RotatingFileHandler
-import time, sys, json, argparse, socket
+import time, sys, json, argparse, socket, hashlib, re, random, string, datetime
+from base64 import urlsafe_b64encode, urlsafe_b64decode
 import asyncio
 import aiohttp
 
 from mqtt import MQTT
 
-__version__ = __VERSION__ = '1.0.0'
+__version__ = __VERSION__ = '2.0.0'
 
 class Vehicle(MQTT):
     '''
@@ -33,11 +35,14 @@ class Vehicle(MQTT):
                         'User-Agent': 'FordPass/5 CFNetwork/1327.0.4 Darwin/21.2.0',
                         'Accept-Encoding': 'gzip, deflate, br',
                      }
+                     
+    client_id = "9fb503e0-715b-47e8-adfd-ad4b7770f73b"
 
     API_URL = 'https://usapi.cv.ford.com/api'  # US Connected Vehicle api
     VEHICLE_URL = 'https://services.cx.ford.com/api'
     USER_URL = 'https://api.mps.ford.com/api'
-    TOKEN_URL = 'https://sso.ci.ford.com/oidc/endpoint/default/token'
+    #TOKEN_URL = 'https://sso.ci.ford.com/oidc/endpoint/default/token'
+    SSO_URL = 'https://sso.ci.ford.com'
 
     def __init__(self, username, fordpassword, vin='', region='CA', log=None, **kwargs):
         super().__init__(log=log, **kwargs)
@@ -49,18 +54,24 @@ class Vehicle(MQTT):
         self.vin = vin
         self.region = region
         self.log.info(f'FordPass v{self.__version__}')
+        self.token_location = './tokens.json'
         self.apiHeaders = { **self.defaultHeaders,
                             'Application-Id': self.regions[region],  
                             'Content-Type': 'application/json',
                           }
+        self.formHeaders = { **self.defaultHeaders,
+                             'Content-Type': 'application/x-www-form-urlencoded',
+                           }
         self.country = 'USA'    # placeholders, gets updated when tokens are obtained
         self.uom_speed = 'MPH'
         self.uom_distance = 'Mi'
         self.uom_pressure = 'KPa'
+        self.session = None
         self.token = None
         self.refresh_token = None
         self.expiresAt = None
         self.refresh_expires_at = None
+        self.readToken()
         self.cache = {}
         self.cache_timeout = 5  #5 second timeout on cache, set to 0 to disable cache
         self.loop = asyncio.get_event_loop()
@@ -85,10 +96,14 @@ class Vehicle(MQTT):
         await super()._publish_command(command, args)
         
     async def _request(self, method, url, api='', **kwargs):
+        '''
+        V 2.0 with redirect capture for new authentication (V2.0) method
+        '''
         try :
             if not kwargs.pop('get_token', False):
                 await self.__acquireToken()
                 
+            get_text = kwargs.pop('get_text', False)
             count = kwargs.pop('count', 0)
                 
             if  count > 2:
@@ -96,22 +111,34 @@ class Vehicle(MQTT):
                 return False
                 
             if 'headers' not in kwargs:
+                if self.token is None:
+                    raise asyncio.exceptions.TimeoutError('No Access token')
+                    
                 kwargs['headers'] = {   **self.apiHeaders,
                                         'auth-token': self.token
                                     }
                                     
             self.log.info(f'{method.upper()} {url}{api}')
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
-                async with session.request(method.upper(), f'{url}{api}', **kwargs) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    elif response.status == 401:
-                        self.log.warning('Permission denied, reauthenticating...')
-                        await self.__refresh_token()
-                        kwargs.pop('headers', None)
-                        return await self._request(method, url, api, count=count + 1, **kwargs)
+            if not self.session:
+                self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0))
+            async with self.session.request(method.upper(), f'{url}{api}', **kwargs) as response:
+                self.log.debug('Response status: {}'.format(response.status))
+                if response.status == 200:
+                    if get_text:
+                        return await response.text()
                     else:
-                        self.log.error(f'Error calling: {url}{api} status: {response.status}')
+                        return await response.json()
+                elif response.status == 302:
+                    #V2.0 authentication redirects URL's
+                    self.log.debug('Redirect url: {}'.format(response.headers["Location"]))
+                    return response.headers["Location"]
+                elif response.status == 401:
+                    self.log.warning('Permission denied, reauthenticating...')
+                    await self.__refresh_token()
+                    kwargs.pop('headers', None)
+                    return await self._request(method, url, api, count=count + 1, **kwargs)
+                else:
+                    self.log.error(f'Error calling: {url}{api} status: {response.status} {await response.text()}')
         except asyncio.exceptions.TimeoutError as e:
             self.log.warning('Request Timeout: {}'.format(e))
             return {}
@@ -119,36 +146,128 @@ class Vehicle(MQTT):
             self.log.exception(e)     
         return {}
 
-    def _set_tokens(self, result):
+    def _set_tokens(self, result, save=True):
+        self.log.debug('set tokens: {}'.format(result))
         if result.get('access_token'):
             self.token = result['access_token']
             self.refresh_token = result.get('refresh_token', self.refresh_token)
-            self.expiresAt = time.time() + result.get('expires_in', 0)
-            self.refresh_expires_at = time.time() + result.get('refresh_expires_in', 0)
+            self.expiresAt = time.time() + result.get('expires_in', 0)                  #timestamp
+            self.refresh_expires_at = time.time() + result.get('refresh_expires_in', 0) #timestamp
             self.country = result.get('country', self.country)
             self.uom_speed = result.get('uomSpeed', self.uom_speed)             #MPH, KPH
             self.uom_distance = result.get('uomDistance', self.uom_distance)    #1= mi, 2 = km
             self.uom_pressure = result.get('uomPressure', self.uom_pressure)    #KPa, PSI
+            if save:
+                self.writeToken(result)
             return True
         return False
-    
-    async def _auth(self):       
+        
+    def writeToken(self, tokens):
+        # Save tokens to file to be reused
+        with open(self.token_location, "w") as outfile:
+            tokens["user_expiry_timestamp"] = self.expiresAt
+            tokens["refresh_expiry_timestamp"] = self.refresh_expires_at
+            json.dump(tokens, outfile)
+
+    def readToken(self):
+        # Get saved token from file
+        try:
+            self.log.debug('reading tokens from {}'.format(self.token_location))
+            with open(self.token_location) as token_file:
+                tokens = json.load(token_file)
+                self._set_tokens(tokens, False)
+                self.expiresAt = tokens.get("user_expiry_timestamp", self.expiresAt)
+                self.refresh_expires_at = tokens.get("refresh_expiry_timestamp", self.refresh_expires_at)
+                self.log.info('tokens loaded')
+        except Exception as e:
+            self.log.warning("cannot load tokens: {}\nWill refresh using credentials".format(e))
+        
+    def secondsToText(self, secs):
+        if secs <=60:
+            return '{}s'.format(secs)
+        return str(datetime.timedelta(seconds = secs))
+        
+    def base64UrlEncode(self,data):
+        return urlsafe_b64encode(data).rstrip(b'=')
+
+    def generate_hash(self, code):
+        m = hashlib.sha256()
+        m.update(code.encode('utf-8'))
+        return self.base64UrlEncode(m.digest()).decode('utf-8')    
+        
+    async def _auth(self):
         '''
+        New Authentication Method (V2.0)
+        Obtain User token and refresh token
+        user token good for 30 minutes, refresh token good for 1 year
+        '''
+        self.log.debug("New Authentication System V2.0")
+        
+        # Auth Step1 (get login url)
+        code1 = ''.join(random.choice(string.ascii_lowercase) for i in range(43))
+        code_verifier = self.generate_hash(code1)
+        result = await self._request('get', self.SSO_URL, api=f'/v1.0/endpoint/default/authorize?redirect_uri=fordapp://userauthorized&response_type=code&scope=openid&max_age=3600&client_id={self.client_id}&code_challenge={code_verifier}&code_challenge_method=S256', headers=self.apiHeaders, get_token=True, get_text=True)
+        if not result:
+            raise Exception('No login URL')
+        login_url = re.findall('data-ibm-login-url="(.*)"\s', result)[0]
+
+        # Auth Step2 (log in and get redirect url)
+        self.log.debug('logging in with URL: {}{}'.format(self.SSO_URL,login_url))
+        data = {
+            "operation": "verify",
+            "login-form-type": "password",
+            "username" : self.username,
+            "password" : self.fordpassword
+
+        }
+        result = await self._request('post', self.SSO_URL, api=login_url, data=data, headers=self.formHeaders, get_token=True, get_text=True, allow_redirects=False)
+        self.log.debug('got result (2): {}'.format(result))
+        if not result:
+            raise Exception('No redirect URL')
+        nextUrl = result
+
+        # Auth Step3 (get grant_id and code)
+        result = await self._request('get', nextUrl, headers=self.apiHeaders, get_token=True, allow_redirects=False)
+        self.log.debug('got result (3): {}'.format(result))
+        if not result:
+            raise Exception('No redirect Parameters')
+
+        query = result.split('?')
+        params = dict(x.split('=') for x in query[1].split('&'))
+        self.log.debug('Params: {}'.format(params))
+
+        # Auth Step4 (get ciToken)
+        data = {
+            "client_id": self.client_id,
+            "grant_type": "authorization_code",
+            "redirect_uri": query[0],
+            "grant_id": params["grant_id"],
+            "code": params["code"],
+            "code_verifier": code1
+            }
+            
+        result = await self._request('post', self.SSO_URL, api='/oidc/endpoint/default/token', data=data, headers=self.formHeaders, get_token=True)
+        if not result.get("access_token"):
+            raise Exception("Could Not Obtain new ciToken")
+
+        # Auth Step5 (exchange ciToken for user token and refresh token)
+        data = {"ciToken": result["access_token"]}
+        result = await self._request('post', self.USER_URL, '/token/v2/cat-with-ci-access-token', headers=self.apiHeaders, json=data, get_token=True)
+        return self._set_tokens(result)
+
+    async def _auth_old(self):       
+        '''
+        Old (V1.0) authentication method
         Authenticate and store the user token
         '''
 
-        data = {    'client_id': '9fb503e0-715b-47e8-adfd-ad4b7770f73b',
+        data = {    'client_id': self.client_id,
                     'grant_type': 'password',
                     'username': self.username,
                     'password': self.fordpassword
                }
 
-        headers = { **self.defaultHeaders,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                  }
-
-        result = await self._request('post', self.TOKEN_URL, data=data, headers=headers, get_token=True)
-        self.log.debug('Auth token result: {}'.format(result))
+        result = await self._request('post', self.SSO_URL, api='/oidc/endpoint/default/token', data=data, headers=self.formHeaders, get_token=True)
         if self._set_tokens(result):
             return await self._get_user_token()
         return False
@@ -158,15 +277,20 @@ class Vehicle(MQTT):
         Exchange a refresh token for a new access dictionary
         '''
         if self.refresh_token is None or time.time() >= self.refresh_expires_at:
-            self.log.info('No refresh token, or has expired, requesting new token')
+            self.log.info('No Refresh Token, or has expired, requesting new Refresh token')
             return await self._auth()
             
-        self.log.info('Using refresh token, expires in: {}s'.format(int(self.refresh_expires_at - time.time())))
+        self.log.info('Using Refresh Token, expires in: {}'.format(self.secondsToText(int(self.refresh_expires_at - time.time()))))
 
         data = {'refresh_token': self.refresh_token}
+        
+        #New (V2.0) method
+        result = await self._request('post', self.USER_URL, '/token/v2/cat-with-refresh-token', headers=self.apiHeaders, json=data, get_token=True)
 
-        result = await self._request('put', self.USER_URL, '/oauth2/v1/refresh', headers=self.apiHeaders, json=data, get_token=True)
-        self.log.debug('Refresh token result: {}'.format(result))
+        #old version (V1.0)
+        #result = await self._request('put', self.USER_URL, '/oauth2/v1/refresh', headers=self.apiHeaders, json=data, get_token=True)
+        if not result:
+            return await self._auth()
         return self._set_tokens(result)
     
     async def __acquireToken(self):
@@ -174,13 +298,14 @@ class Vehicle(MQTT):
         Fetch and refresh token as needed
         '''
         if self.token is None or time.time() >= self.expiresAt:
-            self.log.info('No token, or has expired, requesting new token')
+            self.log.info('No User Token, or has expired, requesting new User Token')
             await self.__refresh_token()
         else:
-            self.log.info('Token is valid, expires in: {}s, continuing'.format(int(self.expiresAt - time.time())))
+            self.log.info('User Token is valid, expires in: {}, continuing'.format(self.secondsToText(int(self.expiresAt - time.time()))))
             
     async def _get_user_token(self):
         '''
+        Old (V1.0) Authentication method
         Exchanges basic token for oauth token
         '''
         if not self.token:
@@ -189,7 +314,6 @@ class Vehicle(MQTT):
         data = {'code': self.token}
         
         result = await self._request('put', self.USER_URL, '/oauth2/v1/token', headers=self.apiHeaders, json=data)
-        self.log.debug('User token result: {}'.format(result))
         return self._set_tokens(result)
         
     def _cache(self, key, value, cache=False):
@@ -561,7 +685,7 @@ def parse_args():
         help='Display version of this program')
     return parser.parse_args()
     
-def setup_logger(logger_name, log_file, level=logging.DEBUG, console=False):
+def setuplogger(logger_name, log_file, level=logging.DEBUG, console=False):
     try: 
         l = logging.getLogger(logger_name)
         formatter = logging.Formatter('[%(asctime)s][%(levelname)5.5s](%(name)-20s) %(message)s')
@@ -593,7 +717,7 @@ if __name__ == "__main__":
 
     #setup logging
     log_name = 'Main'
-    setup_logger(log_name, arg.log, level=log_level,console=True)
+    setuplogger(log_name, arg.log, level=log_level,console=True)
 
     log = logging.getLogger(log_name)
 
